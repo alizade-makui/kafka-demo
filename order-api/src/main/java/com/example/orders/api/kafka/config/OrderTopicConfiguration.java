@@ -9,7 +9,10 @@ import org.springframework.kafka.config.TopicBuilder;
 public class OrderTopicConfiguration {
 
     @Bean
-    NewTopic ordersTopic(@Value("${app.kafka.orders-topic}") String topic) {
-        return TopicBuilder.name(topic).partitions(3).replicas(1).build();
+    public NewTopic ordersTopic(@Value("${app.kafka.orders-topic}") String topicName) {
+        return TopicBuilder.name(topicName)
+                .partitions(3)
+                .replicas(1)
+                .build();
     }
 }

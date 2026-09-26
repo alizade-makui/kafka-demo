@@ -22,6 +22,7 @@ import java.util.UUID;
 @Getter
 @Setter
 public class ProcessedOrder {
+
     @Id
     @Column(name = "order_id")
     private UUID orderId;

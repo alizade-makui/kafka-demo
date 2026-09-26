@@ -24,9 +24,9 @@ public class OrderProcessingServiceImpl implements OrderProcessingService {
     @Override
     public ProcessedOrder process(OrderCreatedEvent event) {
         validate(event);
-        BigDecimal total = event.unitPrice().multiply(BigDecimal.valueOf(event.quantity()));
-        ProcessedOrder order = new ProcessedOrder(event.orderId(), event.eventId(), "PROCESSED", total, Instant.now());
-        return repository.findById(event.orderId()).orElseGet(() -> repository.save(order));
+
+        return repository.findById(event.orderId())
+                .orElseGet(() -> createProcessedOrder(event));
     }
 
     @Override
@@ -56,5 +56,20 @@ public class OrderProcessingServiceImpl implements OrderProcessingService {
                 || event.unitPrice() == null || event.unitPrice().signum() <= 0) {
             throw new InvalidOrderEventException("Invalid order event or unsupported schema version");
         }
+    }
+
+    private ProcessedOrder createProcessedOrder(OrderCreatedEvent event) {
+        BigDecimal total = event.unitPrice()
+                .multiply(BigDecimal.valueOf(event.quantity()));
+
+        ProcessedOrder order = new ProcessedOrder(
+                event.orderId(),
+                event.eventId(),
+                "PROCESSED",
+                total,
+                Instant.now()
+        );
+
+        return repository.save(order);
     }
 }
