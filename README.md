@@ -1,97 +1,218 @@
 # Kafka Orders Demo
 
-A small but complete event-driven order processing demo built with Spring Boot, Apache Kafka, Maven modules, Spring Data JPA, and H2.
+A compact event-driven order-processing demo built with **Java 21**, **Spring Boot**, **Spring Kafka**, **Spring Data JPA**, **H2**, and **Apache Kafka (KRaft)**.
 
-The project shows a practical producer/consumer flow:
-
-1. `order-api` receives an HTTP request.
-2. It creates an `OrderCreatedEvent`.
-3. It publishes the event to Kafka.
-4. `order-worker` consumes the event.
-5. The worker validates and processes the order.
-6. The processed result is stored in H2 and can be queried through REST endpoints.
+The project is intentionally small enough to understand end to end, while still demonstrating the Kafka concepts that matter in a real backend service: keys, partitions, consumer groups, offset handling, idempotent processing, retries, and a Dead Letter Topic (DLT).
 
 ## Architecture
 
 ```text
-Client
-  |
-  | POST /api/orders
-  v
-order-api
-  |
-  | OrderCreatedEvent
-  v
-Kafka topic: orders.created.v1
-  |
-  | consume
-  v
-order-worker
-  |
-  | validate + calculate total amount
-  v
-H2 database: processed_orders
-  |
-  | GET /api/processed-orders
-  v
-Client
+                         POST /api/orders
+                               |
+                               v
+                        +-------------+
+                        |  order-api  |
+                        +------+------+ 
+                               |
+                               | OrderCreatedEvent
+                               | key = orderId
+                               v
+                    +-----------------------+
+                    | orders.created.v1     |
+                    | P0      P1      P2    |
+                    +-----------+-----------+
+                                |
+                                | group: order-processing-v1
+                                v
+                         +--------------+
+                         | order-worker |
+                         +------+-------+
+                                |
+                    +-----------+-----------+
+                    |                       |
+                 success                  failure
+                    |                       |
+                    v                       | retry x2
+             processed_orders               |
+                    |                       v
+                    |              orders.created.v1.dlt
+                    v
+       GET /api/processed-orders/**
 ```
 
 ## Modules
 
 | Module | Responsibility |
 | --- | --- |
-| `order-contracts` | Shared Kafka event contracts, currently `OrderCreatedEvent`. |
-| `order-api` | REST API for accepting order requests and publishing events to Kafka. |
-| `order-worker` | Kafka consumer that processes events, stores results, and exposes query endpoints. |
+| `order-contracts` | Shared Kafka contract containing `OrderCreatedEvent`. |
+| `order-api` | Accepts HTTP order requests, creates events, and publishes them to Kafka. |
+| `order-worker` | Consumes events, validates/processes them, persists results, and exposes query endpoints. |
 
 ## Tech Stack
 
-- Java 21 target
+- Java 21
 - Spring Boot 3.5.x
 - Spring Web
 - Spring Kafka
-- Spring Data JPA
-- H2 file database
-- Apache Kafka via Docker Compose
-- Maven multi-module build
+- Spring Data JPA / Hibernate
 - Bean Validation
+- H2 file database
+- Apache Kafka with KRaft via Docker Compose
+- Maven multi-module build
 - Lombok
 
-## Kafka Flow
+## Kafka Design
 
-The API publishes an event to:
+### Main topic
 
 ```text
 orders.created.v1
 ```
 
-The event key is the `orderId`, which keeps all records for the same order on the same Kafka partition.
+The topic is declared with:
 
-Producer settings include:
+```text
+partitions = 3
+replication-factor = 1
+```
 
-- `acks=all`
-- idempotent producer enabled
-- JSON serialization without type headers
-- bounded send timeout handling
+Replication factor `1` is intentional for this single-broker local demo.
 
-Consumer settings include:
+### Message key
 
-- consumer group: `order-processing-v1`
-- `auto-offset-reset=earliest`
-- record-level offset commit after successful listener execution
-- JSON deserialization into `OrderCreatedEvent`
-- container stop on listener failure
+`orderId` is used as the Kafka key:
+
+```java
+kafkaTemplate.send(topic, event.orderId().toString(), event);
+```
+
+This keeps records with the same order key on the same partition and preserves ordering for that key while allowing different orders to be processed in parallel.
+
+### Producer reliability
+
+The producer uses:
+
+```text
+acks=all
+enable.idempotence=true
+```
+
+The API waits for Kafka acknowledgement before returning `202 Accepted`, and includes the resulting partition and offset in the response.
+
+### Consumer group and concurrency
+
+The worker uses:
+
+```text
+group-id = order-processing-v1
+concurrency = 3
+```
+
+With three partitions, up to three consumers in this group can actively process partitions in parallel.
+
+### Offset handling
+
+```text
+enable-auto-commit=false
+ack-mode=record
+```
+
+The listener only advances successfully handled records through Spring Kafka's container-managed acknowledgement flow.
+
+The design therefore follows an **at-least-once** processing model: a record can be delivered again after a failure, so the consumer must tolerate duplicate delivery.
+
+### Idempotent processing
+
+Processed orders use `order_id` as the database primary key:
+
+```sql
+CREATE TABLE IF NOT EXISTS processed_orders (
+    order_id UUID PRIMARY KEY,
+    event_id UUID NOT NULL,
+    status VARCHAR(30) NOT NULL,
+    total_amount DECIMAL(19, 2) NOT NULL,
+    processed_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
+```
+
+Before creating a row, the worker checks whether the order has already been processed. The primary key remains the final database integrity constraint.
+
+## Retry and Dead Letter Topic
+
+Failed listener processing is handled by Spring Kafka's `DefaultErrorHandler` and `DeadLetterPublishingRecoverer`.
+
+Retryable failures follow this flow:
+
+```text
+original attempt
+      |
+      X
+      |
+   wait 1s
+      |
+   retry #1
+      |
+      X
+      |
+   wait 1s
+      |
+   retry #2
+      |
+      X
+      v
+orders.created.v1.dlt
+```
+
+The current backoff is:
+
+```java
+new FixedBackOff(1_000L, 2L)
+```
+
+So there are **3 total attempts**: the original attempt plus two retries.
+
+`InvalidOrderEventException` is configured as non-retryable because retrying invalid business data will not make it valid:
+
+```text
+InvalidOrderEventException -> DLT directly
+```
+
+The DLT is:
+
+```text
+orders.created.v1.dlt
+```
+
+It also has three partitions so a failed record can be published to the same partition number as the source record.
+
+## Event Contract
+
+`OrderCreatedEvent` currently contains:
+
+```text
+eventId
+schemaVersion
+occurredAt
+orderId
+customerId
+productCode
+quantity
+unitPrice
+```
+
+The demo uses JSON serialization and explicitly targets `OrderCreatedEvent` on the consumer side. Type headers are not required for the main topic.
+
+`schemaVersion` is currently `1`; breaking event changes should be introduced deliberately instead of silently changing the existing contract.
 
 ## REST API
 
-### Create Order
+### Create an order
 
 ```http
 POST /api/orders
 ```
 
-Example request:
+Example body:
 
 ```json
 {
@@ -114,9 +235,9 @@ Example response:
 }
 ```
 
-The API returns `202 Accepted` after Kafka confirms that the event was written. This does not mean the worker has already processed the order. It means the event is safely accepted by Kafka.
+`202 Accepted` means Kafka acknowledged the event. It does **not** mean `order-worker` has already finished processing it.
 
-### Get Processed Order By ID
+### Get a processed order
 
 ```http
 GET /api/processed-orders/{orderId}
@@ -130,105 +251,91 @@ Example response:
   "eventId": "41c33b35-bcd1-4a5d-9b5d-bb21b967951e",
   "status": "PROCESSED",
   "totalAmount": 300000,
-  "processedAt": "2026-09-16T08:30:00Z"
+  "processedAt": "2026-09-26T08:30:00Z"
 }
 ```
 
-### Get Processed Orders With Pagination
+### List processed orders
 
 ```http
 GET /api/processed-orders?page=0
 ```
 
-The page size is fixed at `10` records per page.
+The current page size is fixed at `10`.
 
-Use the next page like this:
-
-```http
-GET /api/processed-orders?page=1
-```
-
-## Data Model
-
-Processed orders are stored in the `processed_orders` table.
-
-```sql
-CREATE TABLE IF NOT EXISTS processed_orders (
-    order_id UUID PRIMARY KEY,
-    event_id UUID NOT NULL,
-    status VARCHAR(30) NOT NULL,
-    total_amount DECIMAL(19, 2) NOT NULL,
-    processed_at TIMESTAMP WITH TIME ZONE NOT NULL
-);
-```
-
-`order_id` is the primary key. This prevents duplicate rows for the same order if Kafka redelivers a message.
-
-## Local Run
+## Running Locally
 
 ### Prerequisites
 
-- Docker Compose v2
-- Maven
 - JDK 21
+- Maven
+- Docker + Docker Compose v2
 
-If you only have JDK 17 installed locally, the current code also compiles with Java 17 when running Maven with:
+### 1. Start Kafka
 
-```powershell
-'-Djava.version=17'
-```
-
-Example:
-
-```powershell
-mvn -pl order-worker -am clean compile '-Djava.version=17'
-```
-
-### Start Kafka
-
-```powershell
+```bash
 docker compose up -d
 ```
 
-Kafka is exposed on:
+Kafka is exposed to host applications at:
 
 ```text
 localhost:9094
 ```
 
-The Docker Compose file disables automatic topic creation. The `order-api` module defines the topic through Spring Kafka admin configuration.
+Automatic topic creation is disabled.
 
-### Run order-api
+### 2. Start `order-api`
+
+The current project declares `orders.created.v1` from `order-api`, so start the API before the worker on a clean Kafka volume.
+
+PowerShell:
 
 ```powershell
 $env:SPRING_KAFKA_BOOTSTRAP_SERVERS='localhost:9094'
 mvn -pl order-api -am spring-boot:run
 ```
 
-The API runs on:
+Bash:
+
+```bash
+SPRING_KAFKA_BOOTSTRAP_SERVERS=localhost:9094 \
+  mvn -pl order-api -am spring-boot:run
+```
+
+API address:
 
 ```text
 http://localhost:8081
 ```
 
-### Run order-worker
+### 3. Start `order-worker`
 
-Open a second terminal:
+PowerShell:
 
 ```powershell
 $env:SPRING_KAFKA_BOOTSTRAP_SERVERS='localhost:9094'
 mvn -pl order-worker -am spring-boot:run
 ```
 
-The worker runs on:
+Bash:
+
+```bash
+SPRING_KAFKA_BOOTSTRAP_SERVERS=localhost:9094 \
+  mvn -pl order-worker -am spring-boot:run
+```
+
+Worker address:
 
 ```text
 http://localhost:8082
 ```
 
-## Manual End-to-End Test
+The worker declares `orders.created.v1.dlt` during startup.
 
-Send an order:
+## End-to-End Test
+
+PowerShell:
 
 ```powershell
 $response = Invoke-RestMethod `
@@ -245,7 +352,7 @@ $response = Invoke-RestMethod `
 $response
 ```
 
-Read the processed result:
+Then query the result:
 
 ```powershell
 Invoke-RestMethod `
@@ -253,30 +360,80 @@ Invoke-RestMethod `
   -Uri "http://localhost:8082/api/processed-orders/$($response.orderId)"
 ```
 
-Read all processed orders, 10 per page:
+Expected flow:
 
-```powershell
-Invoke-RestMethod `
-  -Method Get `
-  -Uri "http://localhost:8082/api/processed-orders?page=0"
+```text
+HTTP request
+    -> order-api returns ACCEPTED
+    -> Kafka stores OrderCreatedEvent
+    -> order-worker consumes it
+    -> processed_orders receives one row
+    -> query endpoint returns PROCESSED
 ```
 
-Expected result:
+## Kafka CLI: Useful Checks
 
-- `order-api` returns `ACCEPTED`.
-- `order-worker` logs the consumed order.
-- H2 stores the processed order.
-- The query endpoint returns `PROCESSED` with the calculated `totalAmount`.
+The Docker Compose service is currently named `Kafka`.
+
+### List topics
+
+```bash
+docker compose exec Kafka kafka-topics \
+  --bootstrap-server kafka:9092 \
+  --list
+```
+
+Expected topics after both applications have started:
+
+```text
+orders.created.v1
+orders.created.v1.dlt
+```
+
+### Describe the main topic
+
+```bash
+docker compose exec Kafka kafka-topics \
+  --bootstrap-server kafka:9092 \
+  --describe \
+  --topic orders.created.v1
+```
+
+### Inspect consumer lag
+
+```bash
+docker compose exec Kafka kafka-consumer-groups \
+  --bootstrap-server kafka:9092 \
+  --describe \
+  --group order-processing-v1
+```
+
+Important columns:
+
+```text
+CURRENT-OFFSET
+LOG-END-OFFSET
+LAG
+```
+
+### Read records from the DLT
+
+```bash
+docker compose exec Kafka kafka-console-consumer \
+  --bootstrap-server kafka:9092 \
+  --topic orders.created.v1.dlt \
+  --from-beginning
+```
 
 ## H2 Console
 
-When `order-worker` is running, open:
+While `order-worker` is running:
 
 ```text
 http://localhost:8082/h2-console
 ```
 
-Use:
+Current connection values:
 
 | Field | Value |
 | --- | --- |
@@ -284,91 +441,94 @@ Use:
 | User Name | `alizadeh` |
 | Password | empty |
 
-Query:
+Example query:
 
 ```sql
 SELECT * FROM processed_orders;
 ```
 
-The database is file-backed, so data survives application restarts as long as the same working directory is used.
-
 ## Build
 
-Run the full Maven build:
+Build all modules:
 
-```powershell
+```bash
 mvn clean verify
 ```
 
-Build only the API and its dependencies:
+Build the API and required modules:
 
-```powershell
-mvn -pl order-api -am clean compile
+```bash
+mvn -pl order-api -am clean verify
 ```
 
-Build only the worker and its dependencies:
+Build the worker and required modules:
 
-```powershell
-mvn -pl order-worker -am clean compile
+```bash
+mvn -pl order-worker -am clean verify
 ```
 
 ## Project Structure
 
 ```text
-kafka-demo
-  order-contracts
-    src/main/java/com/example/orders/contract/kafka/events
-      OrderCreatedEvent.java
-
-  order-api
-    controller
-      OrderController.java
-    kafka/producer
-      OrderPublisher.java
-    kafka/config
-      OrderTopicConfiguration.java
-    service
-      OrderService.java
-    service/impl
-      OrderServiceImpl.java
-
-  order-worker
-    kafka/consumer
-      OrderListener.java
-    controller
-      OrderQueryController.java
-    model/entity
-      ProcessedOrder.java
-    repository
-      ProcessedOrderRepository.java
-    service
-      OrderProcessingService.java
-    service/impl
-      OrderProcessingServiceImpl.java
+kafka-demo/
+├── docker-compose.yaml
+├── pom.xml
+├── order-contracts/
+│   └── src/main/java/com/example/orders/contract/kafka/events/
+│       └── OrderCreatedEvent.java
+├── order-api/
+│   ├── controller/
+│   ├── exception/
+│   ├── kafka/
+│   │   ├── config/
+│   │   └── producer/
+│   ├── model/
+│   └── service/
+└── order-worker/
+    ├── controller/
+    ├── exception/
+    ├── kafka/
+    │   ├── config/
+    │   └── consumer/
+    ├── model/
+    ├── repository/
+    └── service/
 ```
 
-## Why This Project Matters
+## Concepts Demonstrated
 
-This repository demonstrates the core building blocks of an event-driven service:
+This repository demonstrates:
 
-- separating command intake from background processing
-- sharing event contracts through a dedicated module
-- publishing to Kafka with explicit confirmation handling
-- consuming events with a dedicated worker service
-- persisting processed state with JPA
-- exposing query endpoints for processed data
-- handling duplicate delivery with a database primary key
-- keeping the codebase small enough to understand end to end
+- Kafka producer and consumer flow
+- topics and partitions
+- message keys and per-key ordering
+- consumer groups and parallel consumption
+- offsets and record-level acknowledgement
+- at-least-once processing
+- idempotent producer configuration
+- idempotent consumer behavior backed by a database primary key
+- JSON serialization/deserialization
+- retry with fixed backoff
+- non-retryable exceptions
+- Dead Letter Topic handling
+- consumer lag inspection
+- KRaft-based local Kafka setup
 
-It is intentionally simple, but it follows the same flow used in larger production systems.
+## Current Scope and Known Limitations
 
-## Current Limitations
+This is a learning/portfolio demo, not a production Kafka platform.
 
-- No dead-letter topic yet.
-- No retry topic strategy yet.
-- No distributed tracing yet.
-- No production database profile yet.
-- No authentication or authorization.
-- The API stores only Kafka acceptance metadata; processed state belongs to the worker.
+Currently out of scope:
 
-These are good next steps for evolving the demo into a more production-ready sample.
+- request-level idempotency for repeated HTTP submissions
+- automated tests / Testcontainers integration
+- Kafka UI
+- Schema Registry / Avro / Protobuf
+- Kafka transactions / exactly-once stream processing
+- Transactional Outbox
+- multi-broker production replication
+- security (SASL/SSL/ACLs)
+- production database and migrations
+- distributed tracing and production observability
+
+These are intentionally left for a later advanced phase so the core Kafka behavior remains easy to understand.
