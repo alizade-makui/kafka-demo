@@ -15,6 +15,7 @@ import org.springframework.stereotype.Component;
 public class OrderListener {
 
     private static final Logger log = LoggerFactory.getLogger(OrderListener.class);
+
     private final OrderProcessingService processor;
 
     @KafkaListener(topics = "${app.kafka.orders-topic}")
@@ -22,7 +23,15 @@ public class OrderListener {
 
         ProcessedOrder result = processor.process(record.value());
 
-        log.info("orderId={} status={} total={} partition={} offset={}",
-                result.getOrderId(), result.getStatus(), result.getTotalAmount(), record.partition(), record.offset());
+        log.info(
+                "orderId={} key={} status={} total={} partition={} offset={} thread={}",
+                result.getOrderId(),
+                record.key(),
+                result.getStatus(),
+                result.getTotalAmount(),
+                record.partition(),
+                record.offset(),
+                Thread.currentThread().getName()
+        );
     }
 }
